@@ -1,0 +1,7 @@
+.DS_Store
+/.wt_archives/
+/.wt_hooks/
+*.bundle
+*.diff
+dist/
+pkg/

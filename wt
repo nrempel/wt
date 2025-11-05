@@ -1,0 +1,457 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die(){ echo "error: $*" >&2; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+repo_root(){
+  local common_dir gitdir line wt_path resolved_path gitdir_path first_resolved
+  local -a worktrees=()
+  common_dir="$(git rev-parse --git-common-dir 2>/dev/null)" || die "run inside a git repo"
+  if [[ "$common_dir" != /* ]]; then
+    gitdir="$(git rev-parse --git-dir 2>/dev/null)" || die "run inside a git repo"
+    common_dir="$(cd "$gitdir" && pwd -P)" || die "could not resolve repo root"
+  else
+    common_dir="$(cd "$common_dir" && pwd -P)" || die "could not resolve repo root"
+  fi
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      "worktree "*)
+        worktrees+=("${line#worktree }")
+        ;;
+    esac
+  done < <(git worktree list --porcelain)
+
+  [[ ${#worktrees[@]} -gt 0 ]] || die "could not determine repo root"
+
+  first_resolved=""
+  for wt_path in "${worktrees[@]}"; do
+    if ! resolved_path="$(cd "$wt_path" && pwd -P)"; then
+      continue
+    fi
+    [[ -n "$first_resolved" ]] || first_resolved="$resolved_path"
+
+    if gitdir_path="$(git -C "$resolved_path" rev-parse --absolute-git-dir 2>/dev/null)"; then
+      if ! gitdir_path="$(cd "$gitdir_path" && pwd -P)"; then
+        continue
+      fi
+    elif gitdir_path="$(git -C "$resolved_path" rev-parse --git-dir 2>/dev/null)"; then
+      if [[ "$gitdir_path" != /* ]]; then
+        if ! gitdir_path="$(cd "$resolved_path/$gitdir_path" && pwd -P)"; then
+          continue
+        fi
+      else
+        if ! gitdir_path="$(cd "$gitdir_path" && pwd -P)"; then
+          continue
+        fi
+      fi
+    else
+      continue
+    fi
+
+    if [[ "$gitdir_path" == "$common_dir" ]]; then
+      printf '%s\n' "$resolved_path"
+      return 0
+    fi
+  done
+
+  if [[ -n "$first_resolved" ]]; then
+    printf '%s\n' "$first_resolved"
+    return 0
+  fi
+
+  die "could not determine repo root"
+}
+
+usage(){
+  cat <<'USAGE'
+wt new <name> [-b base]           Create worktree .worktrees/<name> from base (default: origin/main)
+wt ls                              List worktrees (path, branch, head)
+wt switch <name|path>              Replace current shell with selected worktree
+wt status [<name|path>]            Show git status for one or all worktrees
+wt rm  [-f|--force] [--delete-branch|--purge] <name|path>
+                                   Remove a worktree; optionally delete its branch:
+                                     --delete-branch  delete if safe (not checked out, not ahead, merged to base)
+                                     --purge          delete branch regardless (dangerous)
+wt archive <name|path>             Tag + bundle branch, write diff (vs main), then remove the worktree
+wt restore <name>                  Re-create branch+worktree from newest bundle (or tag if no bundle)
+wt prune                           Prune stale worktrees
+wt help                            Show this help
+Hooks: .wt_hooks/{post-new,post-archive,post-restore}/*
+  Env: WT_EVENT, WT_ROOT, WT_PATH, WT_BRANCH, WT_NAME, WT_BASE
+USAGE
+}
+
+# Run executable hooks in <repo>/.wt_hooks/<event>/*
+# Exports: WT_EVENT, WT_ROOT, WT_PATH, WT_BRANCH, WT_NAME, WT_BASE
+run_hooks(){
+  local event="$1" root="$2" path="$3" branch="$4" name="$5" base="${6:-}"
+  local dir="$root/.wt_hooks/$event"
+  [[ -d "$dir" ]] || return 0
+  for hook in "$dir"/*; do
+    [[ -f "$hook" && -x "$hook" ]] || continue
+    WT_EVENT="$event" WT_ROOT="$root" WT_PATH="$path" WT_BRANCH="$branch" WT_NAME="$name" WT_BASE="$base" \
+      "$hook"
+  done
+}
+
+worktree_table(){
+  local root="${1:-}"
+  local line path branch head gitdir
+  root="${root:-$(repo_root)}"
+  path=""; branch=""; head=""; gitdir=""
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*)
+        path="${line#worktree }"
+        if [[ -d "$path" ]]; then
+          path="$(cd "$path" && pwd -P)"
+        fi
+        ;;
+      "branch "*)
+        branch="${line#branch }"
+        ;;
+      "HEAD "*)
+        head="${line#HEAD }"
+        ;;
+      "detached")
+        branch="(detached)"
+        ;;
+      "gitdir "*)
+        gitdir="${line#gitdir }"
+        ;;
+      "")
+        if [[ -n "$path" ]]; then
+          printf '%s\t%s\t%s\t%s\n' "$path" "$branch" "$head" "$gitdir"
+        fi
+        path=""; branch=""; head=""; gitdir=""
+        ;;
+    esac
+  done < <(git -C "$root" worktree list --porcelain)
+  if [[ -n "$path" ]]; then
+    printf '%s\t%s\t%s\t%s\n' "$path" "$branch" "$head" "$gitdir"
+  fi
+}
+
+preferred_shell(){
+  local current="${SHELL:-}"
+  if [[ -n "$current" && -x "$current" ]]; then
+    printf '%s\n' "$current"
+    return 0
+  fi
+  local candidate
+  for candidate in bash zsh sh; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  die "no interactive shell found"
+}
+
+enter_worktree(){
+  local dest="$1"
+  cd "$dest" || exit
+  exec "$(preferred_shell)" -l
+}
+
+print_status(){
+  local root="$1" path="$2" branch="$3" rel heading branch_name
+  branch_name="$branch"
+  if [[ "$branch_name" == refs/heads/* ]]; then
+    branch_name="${branch_name#refs/heads/}"
+  elif [[ -z "$branch_name" ]]; then
+    branch_name="(detached)"
+  fi
+  if [[ "$path" == "$root" ]]; then
+    heading="(root)"
+  else
+    rel="${path#$root/}"
+    if [[ "$rel" == "$path" ]]; then
+      heading="$path"
+    else
+      heading="$rel"
+    fi
+  fi
+  printf "== %s (%s) ==\n" "$heading" "$branch_name"
+  git -C "$path" status -sb || die "git status failed for $path"
+}
+
+resolve_path(){
+  local arg="$1" root path p
+  local -a worktrees=() matches=()
+  root="$(repo_root)"
+
+  while IFS=$'\t' read -r path _branch _head _gitdir; do
+    [[ -z "$path" ]] && continue
+    if [[ -d "$path" ]]; then
+      worktrees+=("$path")
+    fi
+  done < <(worktree_table "$root")
+
+  if [[ -d "$arg" ]]; then
+    path="$(cd "$arg" && pwd -P)"
+    for p in "${worktrees[@]}"; do
+      if [[ "$p" == "$path" ]]; then
+        printf '%s\n' "$p"
+        return 0
+      fi
+    done
+  fi
+
+  if [[ -d "$root/.worktrees/$arg" ]]; then
+    printf '%s\n' "$(cd "$root/.worktrees/$arg" && pwd -P)"
+    return 0
+  fi
+
+  for p in "${worktrees[@]}"; do
+    if [[ "${p##*/}" == "$arg" ]]; then
+      matches+=("$p")
+    fi
+  done
+  if [[ "${#matches[@]}" -eq 1 ]]; then
+    printf '%s\n' "${matches[0]}"
+    return 0
+  elif [[ "${#matches[@]}" -gt 1 ]]; then
+    die "ambiguous worktree name: $arg"
+  fi
+
+  die "could not resolve worktree: $arg"
+}
+
+need git
+
+cmd="${1:-}"; shift || true
+case "${cmd:-}" in
+  new)
+    name="${1:-}"; shift || true
+    base=""
+    OPTIND=1
+    while getopts ":b:" opt; do
+      [[ $opt == b ]] && base="$OPTARG"
+    done
+    [[ -n "${name}" ]] || die "usage: wt new <name> [-b base]"
+    [[ "$name" =~ / ]] && die "worktree name cannot contain '/'"
+    [[ "$name" =~ [[:space:]] ]] && die "worktree name cannot contain whitespace"
+    root="$(repo_root)"
+    path="$root/.worktrees/${name}"
+    branch="wt/${name}"
+    [[ -e "$path" ]] && die "worktree path already exists: $path"
+    mkdir -p "$root/.worktrees"
+
+    if [[ -z "$base" ]]; then
+      for candidate in origin/main origin/master main master; do
+        if git -C "$root" rev-parse --verify -q "$candidate" >/dev/null; then
+          base="$candidate"
+          break
+        fi
+      done
+      [[ -n "$base" ]] || die "unable to determine base ref; specify one with -b"
+    fi
+
+    git -C "$root" fetch -q || true
+    git -C "$root" rev-parse --verify -q "$base" >/dev/null || die "base ref '$base' not found"
+    git -C "$root" rev-parse --verify -q "refs/heads/$branch" >/dev/null && die "branch already exists: $branch"
+
+    git -C "$root" worktree add -b "$branch" "$path" "$base"
+    printf "created: %s  (branch %s, base %s)\n" "$path" "$branch" "$base"
+
+    # post-new hooks
+    run_hooks "post-new" "$root" "$path" "$branch" "$name" "$base"
+
+    # auto switch into the new worktree (replace current shell)
+    enter_worktree "$path"
+    ;;
+
+  ls)
+    root="$(repo_root)"
+    git -C "$root" worktree list --porcelain | awk '
+      BEGIN {
+        fmt="%-42s  %-30s  %s\n"
+        printf fmt,"PATH","BRANCH","HEAD"
+        p=""; b=""; h=""
+      }
+      function flush() {
+        if (p!="") {
+          sub(/^refs\/heads\//, "", b)
+          if (b=="") b="(detached)"
+          printf fmt, p, b, h
+        }
+        p=""; b=""; h=""
+      }
+      /^worktree /{ flush(); p=$2; next }
+      /^branch /  { b=$2; next }
+      /^detached/ { b="(detached)"; next }
+      /^HEAD /    { h=$2; next }
+      /^$/        { flush(); next }
+      END         { flush() }
+    '
+    ;;
+
+  switch)
+    target="${1:-}"; [[ -n "$target" ]] || die "usage: wt switch <name|path>"
+    path="$(resolve_path "$target")"
+    enter_worktree "$path"
+    ;;
+
+  status)
+    root="$(repo_root)"
+    if [[ $# -gt 1 ]]; then
+      die "usage: wt status [<name|path>]"
+    fi
+    if [[ $# -eq 1 ]]; then
+      path="$(resolve_path "$1")"
+      branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+      [[ "$branch" == "HEAD" ]] && branch="(detached)"
+      print_status "$root" "$path" "$branch"
+    else
+      first=1
+      while IFS=$'\t' read -r path branch head gitdir; do
+        [[ -z "$path" ]] && continue
+        if [[ "$first" -eq 0 ]]; then
+          echo
+        fi
+        first=0
+        if [[ -z "$branch" ]]; then
+          branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+        fi
+        [[ "$branch" == "HEAD" ]] && branch="(detached)"
+        print_status "$root" "$path" "$branch"
+      done < <(worktree_table "$root")
+    fi
+    ;;
+
+  rm)
+    force="" smart_delete="" base_ref="origin/main"
+    # flags: -f/--force, --delete-branch (smart), --purge (dangerous)
+    while [[ "${1:-}" =~ ^- ]]; do
+      case "$1" in
+        -f|--force) force="--force" ;;
+        -d|--delete-branch) smart_delete="smart" ;;
+        --purge) smart_delete="purge" ;;
+        *) break ;;
+      esac
+      shift
+    done
+    target="${1:-}"; [[ -n "$target" ]] || die "usage: wt rm [-f|--force] [--delete-branch|--purge] <name|path>"
+    root="$(repo_root)"
+    path="$(resolve_path "$target")"
+    branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+
+    if [[ -n "$force" ]]; then
+      git -C "$root" worktree remove "$force" "$path"
+    else
+      git -C "$root" worktree remove "$path"
+    fi
+    echo "removed: $path"
+
+    if [[ -n "$branch" && "$branch" != "HEAD" && "$branch" == wt/* ]]; then
+      case "$smart_delete" in
+        purge)
+          git -C "$root" branch -D "$branch" && echo "deleted branch (purge): $branch"
+          ;;
+        smart)
+          # refuse if checked out elsewhere
+          if git -C "$root" worktree list --porcelain | awk '/^branch /{print $2}' | grep -qx "refs/heads/$branch"; then
+            echo "kept branch (checked out elsewhere): $branch"; exit 0
+          fi
+          # refuse if ahead of upstream
+          upstream="$(git -C "$root" for-each-ref --format='%(upstream:short)' "refs/heads/$branch" || true)"
+          if [[ -n "$upstream" ]]; then
+            ahead="$(git -C "$root" rev-list --left-right --count "$upstream...$branch" | awk '{print $2}')"
+            if [[ "${ahead:-0}" -gt 0 ]]; then
+              echo "kept branch (ahead of upstream): $branch"; exit 0
+            fi
+          fi
+          # refuse if not merged to base (when base exists)
+          if git -C "$root" rev-parse --verify -q "$base_ref" >/dev/null; then
+            if ! git -C "$root" merge-base --is-ancestor "$branch" "$base_ref"; then
+              echo "kept branch (not merged to $base_ref): $branch"; exit 0
+            fi
+          fi
+          git -C "$root" branch -d "$branch" && echo "deleted branch: $branch"
+          ;;
+      esac
+    fi
+    ;;
+
+  archive)
+    target="${1:-}"; [[ -n "$target" ]] || die "usage: wt archive <name|path>"
+    root="$(repo_root)"
+    path="$(resolve_path "$target")"
+    branch="$(git -C "$path" rev-parse --abbrev-ref HEAD)"
+    [[ "$branch" != "HEAD" ]] || die "worktree is on a detached HEAD; create a branch first"
+    head="$(git -C "$path" rev-parse HEAD)"
+    slug="$(basename "$path")"
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    out="$root/.wt_archives"; mkdir -p "$out"
+
+    if [[ -n "$(git -C "$path" status --porcelain)" ]]; then
+      echo "warning: uncommitted changes in $path are NOT archived" >&2
+    fi
+
+    base_ref=""
+    if   git -C "$root" rev-parse --verify -q origin/main >/dev/null; then base_ref="origin/main"
+    elif git -C "$root" rev-parse --verify -q main        >/dev/null; then base_ref="main"
+    fi
+    if [[ -n "$base_ref" ]]; then
+      diff="${out}/${branch//\//-}.${stamp}.diff"
+      mb="$(git -C "$root" merge-base "$branch" "$base_ref")"
+      git -C "$root" diff "$mb".."$branch" > "$diff"
+      echo "wrote diff: $diff"
+    fi
+
+    tag="archive/${slug}-${stamp}"
+    bundle="${out}/${branch//\//-}.${stamp}.bundle"
+    git -C "$root" tag -a "$tag" "$head" -m "archive $slug"
+    git -C "$root" bundle create "$bundle" "$branch"
+    echo "wrote bundle: $bundle"
+
+    git -C "$root" worktree remove "$path"
+    echo "removed worktree: $path"
+    echo "tagged: $tag"
+
+    # post-archive hooks (path may no longer exist)
+    run_hooks "post-archive" "$root" "$path" "$branch" "$slug" "$base_ref"
+    ;;
+
+  restore)
+    name="${1:-}"; [[ -n "$name" ]] || die "usage: wt restore <name>"
+    root="$(repo_root)"
+    dest="$root/.worktrees/${name}"
+    [[ -e "$dest" ]] && die "worktree path already exists: $dest"
+    mkdir -p "$root/.worktrees"
+
+    bundle=""
+    if [[ -d "$root/.wt_archives" ]]; then
+      while IFS= read -r candidate; do bundle="$candidate"; done < <(find "$root/.wt_archives" -maxdepth 1 -type f -name "wt-${name}.*.bundle" | sort)
+      if [[ -z "$bundle" ]]; then
+        while IFS= read -r candidate; do bundle="$candidate"; done < <(find "$root/.wt_archives" -maxdepth 1 -type f -name "*-${name}.*.bundle" | sort)
+      fi
+    fi
+
+    if [[ -n "$bundle" ]]; then
+      git -C "$root" fetch "$bundle" "wt/${name}:wt/${name}"
+      git -C "$root" worktree add "$dest" "wt/${name}"
+      echo "restored from bundle -> $dest"
+      run_hooks "post-restore" "$root" "$dest" "wt/${name}" "$name" ""
+    else
+      tag="$(git -C "$root" tag -l "archive/${name}-*" | tail -n1 || true)"
+      [[ -n "$tag" ]] || die "no bundle or tag found for ${name}"
+      git -C "$root" worktree add -b "wt/${name}" "$dest" "$tag"
+      echo "restored from tag -> $dest"
+      run_hooks "post-restore" "$root" "$dest" "wt/${name}" "$name" ""
+    fi
+    ;;
+
+  prune)
+    git -C "$(repo_root)" worktree prune
+    ;;
+
+  help|"")
+    usage
+    ;;
+
+  *)
+    usage; exit 1 ;;
+esac
