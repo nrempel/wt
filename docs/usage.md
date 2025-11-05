@@ -45,8 +45,14 @@ Removes the worktree directory. For branches starting with `wt/` you can add:
 
 ## `wt restore`
 
-Recreates a worktree from the most recent archive bundle or tag with the given
-name.
+```bash
+wt restore [--force] <name>
+```
+
+- Recreates a worktree from the most recent archive bundle or tag with the given
+  name.
+- Refuses to reset `wt/<name>` if it has commits not present in the archive; pass
+  `--force` to reset the branch back to the archived commit.
 
 ## Hooks
 

@@ -56,7 +56,7 @@ wt rm  [-f|--force] [--delete-branch|--purge] <name|path>
                                      --delete-branch  delete if safe (not checked out, not ahead, merged to base)
                                      --purge          delete branch regardless (dangerous)
 wt archive <name|path>             Tag + bundle branch, write diff (vs main), then remove the worktree
-wt restore <name>                  Re-create branch+worktree from newest bundle (or tag if no bundle)
+wt restore [--force] <name>        Re-create branch+worktree from newest bundle (or tag if no bundle)
 wt prune                           Prune stale worktrees
 wt help                            Show this help
 ```

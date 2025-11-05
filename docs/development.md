@@ -4,6 +4,7 @@
 
 - Git 2.38+
 - `shellcheck` and `shfmt` for linting/formatting
+- Either `shasum` (macOS) or `sha256sum` for creating release artifacts
 
 ## Setup
 

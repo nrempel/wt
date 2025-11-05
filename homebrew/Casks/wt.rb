@@ -1,6 +1,6 @@
 cask "wt" do
-  version "0.1.0"
-  sha256 "5cc8003a5bcc743dcfcd09a9a62479f83eb01db66c4dc29d552f3cfceb022265"
+  version "0.1.1"
+  sha256 "ce2c3ec3b1771295422816c73ffe14ba7873899144124f69f1a2c3568d9fc41d"
 
   url "https://github.com/nrempel/wt/releases/download/v#{version}/wt-#{version}.zip"
   name "wt"

@@ -12,9 +12,9 @@
 1. Update `CHANGELOG.md` and docs.
 2. Package the script:
    ```bash
-   make release VERSION=0.1.0
+   make release VERSION=0.1.1
    ```
-3. Create a GitHub release `v0.1.0` and upload `dist/wt-0.1.0.zip`.
+3. Create a GitHub release `v0.1.1` and upload `dist/wt-0.1.1.zip`.
 
 ## Homebrew Cask
 
@@ -23,8 +23,8 @@
 3. Replace the `version` and `sha256` with the real release values:
    ```ruby
    cask "wt" do
-     version "0.1.0"
-     sha256 "<zip sha256 from dist/wt-0.1.0.zip.sha256>"
+     version "0.1.1"
+     sha256 "<zip sha256 from dist/wt-0.1.1.zip.sha256>"
 
      url "https://github.com/nrempel/wt/releases/download/v#{version}/wt-#{version}.zip"
      ...

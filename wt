@@ -74,7 +74,7 @@ wt rm  [-f|--force] [--delete-branch|--purge] <name|path>
                                      --delete-branch  delete if safe (not checked out, not ahead, merged to base)
                                      --purge          delete branch regardless (dangerous)
 wt archive <name|path>             Tag + bundle branch, write diff (vs main), then remove the worktree
-wt restore <name>                  Re-create branch+worktree from newest bundle (or tag if no bundle)
+wt restore [--force] <name>        Re-create branch+worktree from newest bundle (or tag if no bundle)
 wt prune                           Prune stale worktrees
 wt help                            Show this help
 Hooks: .wt_hooks/{post-new,post-archive,post-restore}/*
@@ -166,7 +166,7 @@ print_status(){
   if [[ "$path" == "$root" ]]; then
     heading="(root)"
   else
-    rel="${path#$root/}"
+    rel="${path#"$root"/}"
     if [[ "$rel" == "$path" ]]; then
       heading="$path"
     else
@@ -219,6 +219,38 @@ resolve_path(){
   die "could not resolve worktree: $arg"
 }
 
+ensure_branch_at_commit(){
+  local root="$1" name="$2" commit="$3" force="$4" source_desc="$5"
+  local ref="refs/heads/wt/${name}"
+  local current=""
+
+  if git -C "$root" rev-parse --verify -q "$ref" >/dev/null; then
+    current="$(git -C "$root" rev-parse "$ref")"
+    if [[ "$current" == "$commit" ]]; then
+      return 0
+    fi
+    if git -C "$root" merge-base --is-ancestor "$current" "$commit"; then
+      git -C "$root" branch --quiet -f "wt/${name}" "$commit"
+      echo "updated branch wt/${name} to ${source_desc}"
+      return 0
+    fi
+    if [[ "$force" == "yes" ]]; then
+      git -C "$root" branch --quiet -f "wt/${name}" "$commit"
+      echo "reset branch wt/${name} to ${source_desc} (--force)"
+      return 0
+    fi
+    die "branch wt/${name} has commits not in ${source_desc}; re-run with --force to reset"
+  else
+    git -C "$root" branch --quiet "wt/${name}" "$commit"
+  fi
+}
+
+delete_ref_if_exists(){
+  local root="$1" ref="$2"
+  [[ -n "$ref" ]] || return 0
+  git -C "$root" update-ref -d "$ref" >/dev/null 2>&1 || true
+}
+
 need git
 
 cmd="${1:-}"; shift || true
@@ -230,6 +262,8 @@ case "${cmd:-}" in
     while getopts ":b:" opt; do
       [[ $opt == b ]] && base="$OPTARG"
     done
+    (( OPTIND > 1 )) && shift $((OPTIND - 1))
+    [[ $# -eq 0 ]] || die "usage: wt new <name> [-b base]"
     [[ -n "${name}" ]] || die "usage: wt new <name> [-b base]"
     [[ "$name" =~ / ]] && die "worktree name cannot contain '/'"
     [[ "$name" =~ [[:space:]] ]] && die "worktree name cannot contain whitespace"
@@ -352,7 +386,7 @@ case "${cmd:-}" in
           ;;
         smart)
           # refuse if checked out elsewhere
-          if git -C "$root" worktree list --porcelain | awk '/^branch /{print $2}' | grep -qx "refs/heads/$branch"; then
+          if git -C "$root" worktree list --porcelain | awk '/^branch /{print $2}' | grep -Fxq "refs/heads/$branch"; then
             echo "kept branch (checked out elsewhere): $branch"; exit 0
           fi
           # refuse if ahead of upstream
@@ -416,7 +450,18 @@ case "${cmd:-}" in
     ;;
 
   restore)
-    name="${1:-}"; [[ -n "$name" ]] || die "usage: wt restore <name>"
+    force=""
+    while [[ "${1:-}" =~ ^- ]]; do
+      case "$1" in
+        -f|--force) force="yes" ;;
+        --) shift; break ;;
+        *) die "usage: wt restore [--force] <name>" ;;
+      esac
+      shift
+    done
+    name="${1:-}"; [[ -n "$name" ]] || die "usage: wt restore [--force] <name>"
+    shift || true
+    [[ $# -eq 0 ]] || die "usage: wt restore [--force] <name>"
     root="$(repo_root)"
     dest="$root/.worktrees/${name}"
     [[ -e "$dest" ]] && die "worktree path already exists: $dest"
@@ -430,18 +475,33 @@ case "${cmd:-}" in
       fi
     fi
 
+    source_desc=""
+    commit=""
+    tmp_ref=""
+
     if [[ -n "$bundle" ]]; then
-      git -C "$root" fetch "$bundle" "wt/${name}:wt/${name}"
-      git -C "$root" worktree add "$dest" "wt/${name}"
-      echo "restored from bundle -> $dest"
-      run_hooks "post-restore" "$root" "$dest" "wt/${name}" "$name" ""
+      tmp_ref="refs/wt-restore/tmp-${name}-$$"
+      if ! git -C "$root" fetch --no-tags --quiet "$bundle" "wt/${name}:$tmp_ref"; then
+        delete_ref_if_exists "$root" "$tmp_ref"
+        die "failed to import archive bundle for ${name}"
+      fi
+      commit="$(git -C "$root" rev-parse "$tmp_ref")"
+      source_desc="archive bundle"
+      trap 'delete_ref_if_exists "$root" "$tmp_ref"' EXIT
     else
       tag="$(git -C "$root" tag -l "archive/${name}-*" | tail -n1 || true)"
       [[ -n "$tag" ]] || die "no bundle or tag found for ${name}"
-      git -C "$root" worktree add -b "wt/${name}" "$dest" "$tag"
-      echo "restored from tag -> $dest"
-      run_hooks "post-restore" "$root" "$dest" "wt/${name}" "$name" ""
+      commit="$(git -C "$root" rev-parse "${tag}^{commit}")"
+      source_desc="archive tag ${tag}"
     fi
+
+    ensure_branch_at_commit "$root" "$name" "$commit" "$force" "$source_desc"
+    delete_ref_if_exists "$root" "$tmp_ref"
+    [[ -n "$tmp_ref" ]] && trap - EXIT
+
+    git -C "$root" worktree add "$dest" "wt/${name}"
+    echo "restored from ${source_desc} -> $dest"
+    run_hooks "post-restore" "$root" "$dest" "wt/${name}" "$name" ""
     ;;
 
   prune)
