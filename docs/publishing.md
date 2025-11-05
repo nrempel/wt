@@ -2,18 +2,9 @@
 
 ## GitHub
 
-1. Initialize the repository and commit the contents:
+1. Ensure `main` contains the latest changes:
    ```bash
-   git init
-   git add .
-   git commit -m "Initial commit"
-   ```
-2. Create a new repository on GitHub (e.g. `github.com/USERNAME/wt`).
-3. Add the remote and push:
-   ```bash
-   git remote add origin git@github.com:USERNAME/wt.git
-   git branch -M main
-   git push -u origin main
+   git push origin main
    ```
 
 ## Releases

@@ -8,8 +8,8 @@
 ## Setup
 
 ```bash
-git clone https://github.com/USERNAME/REPO.git
-cd REPO
+git clone https://github.com/nrempel/wt.git
+cd wt
 make install PREFIX=/usr/local   # optional
 ```
 

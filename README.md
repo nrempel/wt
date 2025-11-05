@@ -20,10 +20,9 @@ archiving, and restoring temporary worktrees that you keep under
 
 ### Homebrew (recommended once a release is published)
 
-1. Tap the repo (replace `USERNAME` and `REPO` with the GitHub coordinates after
-   publishing):
+1. Tap the repo:
    ```bash
-   brew tap USERNAME/tap https://github.com/USERNAME/REPO.git
+   brew tap nrempel/tap https://github.com/nrempel/homebrew-tap.git
    ```
 2. Install the cask:
    ```bash
@@ -33,15 +32,15 @@ archiving, and restoring temporary worktrees that you keep under
 ### Manual install
 
 ```bash
-curl -L https://github.com/USERNAME/REPO/releases/latest/download/wt -o /usr/local/bin/wt
+curl -L https://github.com/nrempel/wt/releases/latest/download/wt -o /usr/local/bin/wt
 chmod +x /usr/local/bin/wt
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/USERNAME/REPO.git
-cd REPO
+git clone https://github.com/nrempel/wt.git
+cd wt
 make install PREFIX=/usr/local
 ```
 
